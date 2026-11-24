@@ -1,0 +1,20 @@
+services:
+  ais-port:
+    build: .
+    image: ais-port-dw:latest
+    container_name: ais-port-dw
+    ports:
+      - "8000:8000"
+    environment:
+      # 矩形港区（闭区间，边界算港内）
+      PORT_MIN_LON: "121.0"
+      PORT_MIN_LAT: "31.0"
+      PORT_MAX_LON: "122.0"
+      PORT_MAX_LAT: "32.0"
+      AIS_DB_PATH: "/data/ais.db"
+    volumes:
+      - ais-data:/data
+    restart: unless-stopped
+
+volumes:
+  ais-data:
