@@ -39,6 +39,17 @@ FastAPI 提供 HTTP API，SQLite（WAL 模式）持久化批次、消息与每�
 - WAL 模式保证核算（写事务）进行期间，旧结果仍可被并发查询；
 - `BEGIN IMMEDIATE` 串行化写事务，并发补交不会互相覆盖。
 
+### 结果明细压缩存储
+
+- 新版本的停靠/待补明细**只落无损压缩内容**：按 `(版本, 船, 类型)` 存放于 `record_blob`，
+  不再向 `stop_record` / `pending_record` 写明文（压缩前为紧凑 JSON，`json+zlib` 无损压缩）。
+- 按船回查时**只解码所查船**的那一块，返回字段、顺序与来源查询规则与旧接口完全一致。
+- 未受影响的船直接沿用上一版：上一版已是压缩块则原样拷贝（不解码）；
+  上一版是旧库明文时，按原规则读取该船明文并首次压缩，与批次在同一事务内原子生效。
+- 旧库历史版本（`result_version.storage = 'plain'`）保留明文明细，仍可直接查询；
+  启动时自动为老库补 `storage` 列与 `record_blob` 表，无需重建。
+- 受影响船重算时，上一版已被压缩的判定按原规则解码沿用（段级/港内段级沿用照旧）。
+
 ## 2. 启动
 
 ### docker compose
@@ -101,7 +112,7 @@ curl "http://localhost:8000/ships/SH01/stops?version_id=1"  # 指定历史版本
 | --- | --- |
 | `GET /health` | 健康检查、现行港区与现行版本号 |
 | `GET /batches/{batch_no}` | 批次信息与现行消息数 |
-| `GET /versions` | 全部结果版本（含历史版本与 active 标记） |
+| `GET /versions` | 全部结果版本（含历史版本、`active` 与存储形式 `storage`） |
 
 ## 4. 测试
 
@@ -111,17 +122,19 @@ python -m pytest -q
 ```
 
 覆盖：矩形边界、30 分钟断段、停靠/待补分类、同号异值与同船同刻异号整批退回、
-多批来源叠加、换交失效与他批保留、段级/港内段级增量沿用、历史版本查询、写入失败回滚。
+多批来源叠加、换交失效与他批保留、段级/港内段级增量沿用、历史版本查询、写入失败回滚、
+新版本仅存压缩块、按船解码、未受影响船直接沿用压缩块、旧库明文版本兼容与首次压缩升级。
 
 ## 5. 目录结构
 
 ```
 app/
   config.py    # 港区矩形与 DB 路径配置
-  database.py  # SQLite 连接、WAL、表结构、事务上下文
+  compress.py  # 结果明细无损压缩编解码（json+zlib）
+  database.py  # SQLite 连接、WAL、表结构（含压缩块表与旧库迁移）、事务上下文
   engine.py    # 纯逻辑：UTC 解析、断段、港内连续点与沿用判定
   models.py    # Pydantic 请求/响应模型
-  service.py   # 批次校验、换交、增量核算事务、查询装配
+  service.py   # 批次校验、换交、增量核算事务、压缩存取、查询装配
   main.py      # FastAPI 路由
 tests/         # pytest 引擎单测与 API 端到端测试
 docker-compose.yml / Dockerfile / requirements.txt

@@ -88,3 +88,4 @@ class VersionInfo(BaseModel):
     created_at: str
     batches: list[str]
     active: bool
+    storage: Literal["plain", "blob"] = "plain"

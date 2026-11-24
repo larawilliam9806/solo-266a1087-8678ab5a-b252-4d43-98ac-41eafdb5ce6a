@@ -46,15 +46,32 @@ CREATE TABLE IF NOT EXISTS message_source (
 );
 
 -- 每次批次生效对应一个结果版本，版本永不删除，支持查询旧结果
+-- storage：plain = 旧版明文明细（stop_record/pending_record），
+--          blob  = 新版无损压缩明细（record_blob，按船分块）
 CREATE TABLE IF NOT EXISTS result_version (
     version_id  INTEGER PRIMARY KEY AUTOINCREMENT,
     created_at  TEXT NOT NULL,
     batch_set   TEXT NOT NULL,           -- 当时现行批次号集合的哈希
     batches     TEXT NOT NULL,           -- 现行批次号 JSON 数组
-    active      INTEGER NOT NULL DEFAULT 0
+    active      INTEGER NOT NULL DEFAULT 0,
+    storage     TEXT NOT NULL DEFAULT 'plain'
 );
 
--- 停靠记录：连续港内点在同一段内前后都紧邻港外点
+-- 新版本结果明细：按 (版本, 船, 类型) 存放无损压缩后的 JSON。
+-- 新版本不再向 stop_record/pending_record 写明文；旧版本仍保留明文，可直接查。
+CREATE TABLE IF NOT EXISTS record_blob (
+    version_id      INTEGER NOT NULL,
+    ship_no         TEXT NOT NULL,
+    kind            TEXT NOT NULL,       -- stop | pending
+    codec           TEXT NOT NULL,       -- 如 zlib+json
+    record_count    INTEGER NOT NULL,
+    raw_size        INTEGER NOT NULL,    -- 压缩前字节数，便于核对无损与压缩率
+    payload         BLOB NOT NULL,       -- 无损压缩后的明细
+    PRIMARY KEY (version_id, ship_no, kind),
+    FOREIGN KEY (version_id) REFERENCES result_version(version_id)
+);
+
+-- 停靠记录：连续港内点在同一段内前后都紧邻港外点（旧版明文存储）
 CREATE TABLE IF NOT EXISTS stop_record (
     version_id      INTEGER NOT NULL,
     ship_no         TEXT NOT NULL,
@@ -89,6 +106,7 @@ CREATE INDEX IF NOT EXISTS idx_msg_ship_ts ON message(ship_no, ts, active);
 CREATE INDEX IF NOT EXISTS idx_src_batch   ON message_source(batch_no);
 CREATE INDEX IF NOT EXISTS idx_stop_ver    ON stop_record(version_id, ship_no);
 CREATE INDEX IF NOT EXISTS idx_pend_ver    ON pending_record(version_id, ship_no);
+CREATE INDEX IF NOT EXISTS idx_blob_ver    ON record_blob(version_id, ship_no);
 CREATE INDEX IF NOT EXISTS idx_ver_active  ON result_version(active);
 """
 
@@ -111,6 +129,19 @@ def connect(db_path: str | None = None) -> sqlite3.Connection:
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    _migrate(conn)
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """旧库就地补齐：历史版本标记为明文明细，新版本才写压缩块。"""
+    cols = {
+        r["name"] for r in conn.execute("PRAGMA table_info(result_version)")
+    }
+    if "storage" not in cols:
+        conn.execute(
+            "ALTER TABLE result_version "
+            "ADD COLUMN storage TEXT NOT NULL DEFAULT 'plain'"
+        )
 
 
 @contextmanager

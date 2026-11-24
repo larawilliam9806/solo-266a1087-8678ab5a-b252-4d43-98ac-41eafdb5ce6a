@@ -7,6 +7,7 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from .compress import decode_records, encode_records
 from .config import PortRect
 from .engine import (
     InPortRun,
@@ -48,10 +49,164 @@ def _point_json(p: Point) -> str:
     )
 
 
+def _point_msg_no(raw: str | dict) -> str:
+    return _point_obj(raw)["msg_no"]
+
+
+def _point_obj(raw: str | dict) -> dict:
+    # 明文版本的点是 JSON 文本；压缩块内的点是嵌套对象（避免二次转义）
+    return json.loads(raw) if isinstance(raw, str) else dict(raw)
+
+
 def _batch_set_hash(batch_nos: list[str]) -> str:
     return hashlib.sha256(
         json.dumps(batch_nos, separators=(",", ":"), ensure_ascii=False).encode()
     ).hexdigest()
+
+
+# ---------------------------------------------------------------- 压缩明细存取
+#
+# 新版本的结果明细按 (版本, 船, 类型) 压缩存放：查询只解码所查船的那一块，
+# 核算只解码受影响船的那一块；未受影响船直接拷贝压缩块。旧版本保持明文明细，
+# 首次生成压缩版时按旧规则读取上一版明文即可。
+
+_BLOB_FIELDS = (
+    "seg_no",
+    "run_no",
+    "seg_key",
+    "entry_point",
+    "exit_point",
+    "before_point",
+    "after_point",
+    "reason",
+)
+
+
+def _blob_record(rec: dict[str, Any]) -> dict[str, Any]:
+    """取压缩块需要的字段（船号由块键给出，不必逐条重复）。
+
+    点统一转成嵌套对象再整体压缩，避免 JSON 文本二次转义带来的额外体积。
+    """
+    out: dict[str, Any] = {}
+    for k in _BLOB_FIELDS:
+        if k not in rec:
+            continue
+        v = rec[k]
+        if k.endswith("_point") and v is not None:
+            v = _point_obj(v)
+        out[k] = v
+    return out
+
+
+def _write_blob(
+    conn: sqlite3.Connection,
+    version_id: int,
+    ship_no: str,
+    kind: str,
+    records: list[dict[str, Any]],
+) -> None:
+    """无损压缩并写入某船某类型的明细块（同一事务内完成，失败即整体回滚）。"""
+    records = sorted(records, key=lambda r: (r["seg_no"], r["run_no"]))
+    codec, payload, raw_size = encode_records([_blob_record(r) for r in records])
+    conn.execute(
+        "INSERT INTO record_blob(version_id, ship_no, kind, codec, "
+        "record_count, raw_size, payload) VALUES(?,?,?,?,?,?,?)",
+        (version_id, ship_no, kind, codec, len(records), raw_size, payload),
+    )
+
+
+def _read_ship_records(
+    conn: sqlite3.Connection,
+    version: sqlite3.Row,
+    ship_no: str,
+    kind: str,
+) -> list[dict[str, Any]]:
+    """读取某船某类型的明细：压缩版本解码该船一块，明文版本直接查询。"""
+    if version["storage"] == "blob":
+        row = conn.execute(
+            "SELECT codec, payload FROM record_blob "
+            "WHERE version_id=? AND ship_no=? AND kind=?",
+            (version["version_id"], ship_no, kind),
+        ).fetchone()
+        if row is None:
+            return []
+        records = decode_records(row["payload"], row["codec"])
+        for rec in records:
+            rec["ship_no"] = ship_no
+        records.sort(key=lambda r: (r["seg_no"], r["run_no"]))
+        return records
+
+    table = "stop_record" if kind == "stop" else "pending_record"
+    out: list[dict[str, Any]] = []
+    for row in conn.execute(
+        f"SELECT * FROM {table} WHERE version_id=? AND ship_no=? "
+        f"ORDER BY seg_no, run_no",
+        (version["version_id"], ship_no),
+    ):
+        # 与压缩块一致的内部表示：点是嵌套对象而非 JSON 文本
+        rec = {
+            "ship_no": row["ship_no"],
+            "seg_no": row["seg_no"],
+            "run_no": row["run_no"],
+            "seg_key": row["seg_key"],
+            "entry_point": _point_obj(row["entry_point"]),
+            "exit_point": _point_obj(row["exit_point"]),
+            "before_point": _point_obj(row["before_point"])
+            if row["before_point"] is not None
+            else None,
+            "after_point": _point_obj(row["after_point"])
+            if row["after_point"] is not None
+            else None,
+        }
+        if kind == "pending":
+            rec["reason"] = row["reason"]
+        out.append(rec)
+    return out
+
+
+def _carry_unaffected(
+    conn: sqlite3.Connection,
+    old_version: sqlite3.Row,
+    new_vid: int,
+    affected_ships: set[str],
+) -> None:
+    """未受影响的船沿用上一版结果。
+
+    上一版已是压缩版时直接拷贝压缩块（不解码）；上一版是旧库明文时，
+    按船读取明文并首次压缩，保持同一批次内原子生效。
+    """
+    if old_version["storage"] == "blob":
+        if affected_ships:
+            marks = ",".join("?" * len(affected_ships))
+            where = f" AND ship_no NOT IN ({marks})"
+            params: list[Any] = [new_vid, old_version["version_id"], *sorted(affected_ships)]
+        else:
+            where = ""
+            params = [new_vid, old_version["version_id"]]
+        conn.execute(
+            "INSERT INTO record_blob(version_id, ship_no, kind, codec, "
+            "record_count, raw_size, payload) "
+            "SELECT ?, ship_no, kind, codec, record_count, raw_size, payload "
+            f"FROM record_blob WHERE version_id=?{where}",
+            params,
+        )
+        return
+
+    # 上一版是旧库明文：逐船首次压缩，保持同一批次内原子生效
+    ships: set[str] = set()
+    for table in ("stop_record", "pending_record"):
+        ships.update(
+            r["ship_no"]
+            for r in conn.execute(
+                f"SELECT DISTINCT ship_no FROM {table} WHERE version_id=?",
+                (old_version["version_id"],),
+            )
+        )
+    for ship_no in sorted(ships - affected_ships):
+        for kind in ("stop", "pending"):
+            records = _read_ship_records(conn, old_version, ship_no, kind)
+            if records:
+                _write_blob(conn, new_vid, ship_no, kind, records)
 
 
 # ---------------------------------------------------------------- 批次校验
@@ -221,7 +376,7 @@ def apply_batch(
 
     # 3) 结果版本
     old_version = conn.execute(
-        "SELECT version_id FROM result_version WHERE active=1 ORDER BY version_id DESC"
+        "SELECT * FROM result_version WHERE active=1 ORDER BY version_id DESC"
     ).fetchone()
     old_vid = old_version["version_id"] if old_version else None
 
@@ -229,9 +384,10 @@ def apply_batch(
         r["batch_no"]
         for r in conn.execute("SELECT batch_no FROM batch ORDER BY batch_no")
     ]
+    # 新版本一律使用压缩明细存储；旧版本保持原样，仍可直接查询。
     cur = conn.execute(
-        "INSERT INTO result_version(created_at, batch_set, batches, active) "
-        "VALUES(?,?,?,0)",
+        "INSERT INTO result_version(created_at, batch_set, batches, active, storage) "
+        "VALUES(?,?,?,0,'blob')",
         (_now(), _batch_set_hash(active_batches), json.dumps(active_batches)),
     )
     new_vid = cur.lastrowid
@@ -239,55 +395,21 @@ def apply_batch(
     reused = 0
     recomputed = 0
 
-    if old_vid is not None and affected_ships:
-        marks = ",".join("?" * len(affected_ships))
-        conn.execute(
-            f"INSERT INTO stop_record(version_id, ship_no, seg_no, run_no, "
-            f"entry_point, exit_point, before_point, after_point, seg_key) "
-            f"SELECT ?, ship_no, seg_no, run_no, entry_point, exit_point, "
-            f"before_point, after_point, seg_key FROM stop_record "
-            f"WHERE version_id=? AND ship_no NOT IN ({marks})",
-            [new_vid, old_vid, *affected_ships],
-        )
-        conn.execute(
-            f"INSERT INTO pending_record(version_id, ship_no, seg_no, run_no, "
-            f"entry_point, exit_point, before_point, after_point, reason, seg_key) "
-            f"SELECT ?, ship_no, seg_no, run_no, entry_point, exit_point, "
-            f"before_point, after_point, reason, seg_key FROM pending_record "
-            f"WHERE version_id=? AND ship_no NOT IN ({marks})",
-            [new_vid, old_vid, *affected_ships],
-        )
-    elif old_vid is not None:
-        conn.execute(
-            "INSERT INTO stop_record(version_id, ship_no, seg_no, run_no, "
-            "entry_point, exit_point, before_point, after_point, seg_key) "
-            "SELECT ?, ship_no, seg_no, run_no, entry_point, exit_point, "
-            "before_point, after_point, seg_key FROM stop_record WHERE version_id=?",
-            (new_vid, old_vid),
-        )
-        conn.execute(
-            "INSERT INTO pending_record(version_id, ship_no, seg_no, run_no, "
-            "entry_point, exit_point, before_point, after_point, reason, seg_key) "
-            "SELECT ?, ship_no, seg_no, run_no, entry_point, exit_point, "
-            "before_point, after_point, reason, seg_key FROM pending_record "
-            "WHERE version_id=?",
-            (new_vid, old_vid),
-        )
+    # 3a) 未受影响的船：上一版已压缩则直接拷贝压缩块，否则按旧规则首次压缩
+    if old_version is not None:
+        _carry_unaffected(conn, old_version, new_vid, affected_ships)
 
     # 4) 受影响船逐船重建（含段级/港内段级沿用）
-    old_records: dict[tuple[str, str, str], dict[str, str]] = {}
-    if old_vid is not None:
-        for table in ("stop_record", "pending_record"):
-            for row in conn.execute(
-                f"SELECT * FROM {table} WHERE version_id=? AND ship_no IN "
-                f"({','.join('?' * len(affected_ships))})"
-                if affected_ships
-                else f"SELECT * FROM {table} WHERE 0",
-                [old_vid, *affected_ships] if affected_ships else [],
-            ).fetchall():
-                entry_no = json.loads(row["entry_point"])["msg_no"]
-                exit_no = json.loads(row["exit_point"])["msg_no"]
-                old_records[(row["seg_key"], entry_no, exit_no)] = dict(row)
+    #    上一版的判定按原规则读取：压缩版只解码该船一块，旧库明文直接查表。
+    old_records: dict[tuple[str, str, str], dict[str, Any]] = {}
+    if old_version is not None:
+        for ship_no in sorted(affected_ships):
+            for kind in ("stop", "pending"):
+                for rec in _read_ship_records(conn, old_version, ship_no, kind):
+                    old_records[
+                        (rec["seg_key"], _point_msg_no(rec["entry_point"]),
+                         _point_msg_no(rec["exit_point"]))
+                    ] = rec
 
     # 仅真正失效的消息作为删除标记；其他批次仍提供的消息不产生任何变化。
     # 删除标记不参与实际判定（判定只基于现存点），仅用于增量沿用的触及判断。
@@ -297,6 +419,7 @@ def apply_batch(
             removed_by_ship.setdefault(r["ship_no"], []).append(r)
 
     for ship_no in sorted(affected_ships):
+        ship_records: dict[str, list[dict[str, Any]]] = {"stop": [], "pending": []}
         points: list[Point] = []
         for row in conn.execute(
             "SELECT * FROM message WHERE ship_no=? AND active=1 ORDER BY ts, msg_no",
@@ -348,7 +471,7 @@ def apply_batch(
                 ]
                 if seg_old:
                     for rec in seg_old:
-                        _copy_old_record(conn, new_vid, rec)
+                        ship_records[_kind_of(rec)].append(rec)
                         reused += 1
                     continue
             seg_has_removal = any(
@@ -368,11 +491,17 @@ def apply_batch(
                     and not seg_has_removal
                     and run_reusable(run)
                 ):
-                    _copy_old_record(conn, new_vid, old_rec)
+                    ship_records[_kind_of(old_rec)].append(old_rec)
                     reused += 1
                 else:
-                    _insert_run_record(conn, new_vid, run)
+                    rec = _insert_run_record(conn, new_vid, run)
+                    ship_records[_kind_of(rec)].append(rec)
                     recomputed += 1
+
+        # 该船结果即时无损压缩落库；无记录的船不占用存储，失败则整个事务回滚
+        for kind in ("stop", "pending"):
+            if ship_records[kind]:
+                _write_blob(conn, new_vid, ship_no, kind, ship_records[kind])
 
     # 5) 切换现行版本
     conn.execute("UPDATE result_version SET active=0 WHERE active=1")
@@ -388,84 +517,34 @@ def apply_batch(
     }
 
 
-def _copy_old_record(conn: sqlite3.Connection, new_vid: int, rec: dict[str, Any]):
-    if "reason" in rec:
-        conn.execute(
-            "INSERT INTO pending_record(version_id, ship_no, seg_no, run_no, "
-            "entry_point, exit_point, before_point, after_point, reason, seg_key) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?)",
-            (
-                new_vid,
-                rec["ship_no"],
-                rec["seg_no"],
-                rec["run_no"],
-                rec["entry_point"],
-                rec["exit_point"],
-                rec["before_point"],
-                rec["after_point"],
-                rec["reason"],
-                rec["seg_key"],
-            ),
-        )
-    else:
-        conn.execute(
-            "INSERT INTO stop_record(version_id, ship_no, seg_no, run_no, "
-            "entry_point, exit_point, before_point, after_point, seg_key) "
-            "VALUES(?,?,?,?,?,?,?,?,?)",
-            (
-                new_vid,
-                rec["ship_no"],
-                rec["seg_no"],
-                rec["run_no"],
-                rec["entry_point"],
-                rec["exit_point"],
-                rec["before_point"],
-                rec["after_point"],
-                rec["seg_key"],
-            ),
-        )
+def _kind_of(rec: dict[str, Any]) -> str:
+    """记录类型：待补记录带 reason 字段。"""
+    return "pending" if "reason" in rec else "stop"
 
 
-def _insert_run_record(conn: sqlite3.Connection, new_vid: int, run: InPortRun):
-    entry_json = _point_json(run.entry)
-    exit_json = _point_json(run.exit_point)
+def _insert_run_record(
+    conn: sqlite3.Connection, version_id: int, run: InPortRun
+) -> dict[str, Any]:
+    """生成一条重算记录。
+
+    明细不再逐条落明文表，而是在该船结果算完后统一无损压缩写入
+    （见 _write_blob）；此函数仍保留原名称与签名，异常同样会导致事务回滚。
+    """
     before_json = _point_json(run.before) if run.before is not None else None
     after_json = _point_json(run.after) if run.after is not None else None
-    if run.is_stop:
-        conn.execute(
-            "INSERT INTO stop_record(version_id, ship_no, seg_no, run_no, "
-            "entry_point, exit_point, before_point, after_point, seg_key) "
-            "VALUES(?,?,?,?,?,?,?,?,?)",
-            (
-                new_vid,
-                run.entry.ship_no,
-                run.seg_no,
-                run.run_no,
-                entry_json,
-                exit_json,
-                before_json,
-                after_json,
-                run.seg_key,
-            ),
-        )
-    else:
-        conn.execute(
-            "INSERT INTO pending_record(version_id, ship_no, seg_no, run_no, "
-            "entry_point, exit_point, before_point, after_point, reason, seg_key) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?)",
-            (
-                new_vid,
-                run.entry.ship_no,
-                run.seg_no,
-                run.run_no,
-                entry_json,
-                exit_json,
-                before_json,
-                after_json,
-                run.pending_reason,
-                run.seg_key,
-            ),
-        )
+    rec = {
+        "ship_no": run.entry.ship_no,
+        "seg_no": run.seg_no,
+        "run_no": run.run_no,
+        "seg_key": run.seg_key,
+        "entry_point": _point_json(run.entry),
+        "exit_point": _point_json(run.exit_point),
+        "before_point": before_json,
+        "after_point": after_json,
+    }
+    if not run.is_stop:
+        rec["reason"] = run.pending_reason
+    return rec
 
 
 # ---------------------------------------------------------------- 查询
@@ -482,10 +561,10 @@ def resolve_version(
     ).fetchone()
 
 
-def _enrich_point(conn: sqlite3.Connection, raw: Optional[str]) -> Optional[dict]:
+def _enrich_point(conn: sqlite3.Connection, raw: Optional[str | dict]) -> Optional[dict]:
     if raw is None:
         return None
-    point = json.loads(raw)
+    point = _point_obj(raw)
     batches = [
         r["batch_no"]
         for r in conn.execute(
@@ -493,11 +572,19 @@ def _enrich_point(conn: sqlite3.Connection, raw: Optional[str]) -> Optional[dict
             (point["msg_no"],),
         )
     ]
-    point["source_batches"] = batches
-    return point
+    # 固定字段与顺序（与压缩无关），沿用现有接口的点表示
+    return {
+        "msg_no": point["msg_no"],
+        "ts": point["ts"],
+        "lon": point["lon"],
+        "lat": point["lat"],
+        "in_port": point["in_port"],
+        "source_batches": batches,
+    }
 
 
-def _row_to_record(conn: sqlite3.Connection, row: sqlite3.Row, kind: str) -> dict:
+def _row_to_record(conn: sqlite3.Connection, row: dict[str, Any], kind: str) -> dict:
+    """把（明文行或解压出的记录）装配成接口返回结构，字段与顺序保持不变。"""
     base = {
         "ship_no": row["ship_no"],
         "seg_no": row["seg_no"],
@@ -522,19 +609,20 @@ def _row_to_record(conn: sqlite3.Connection, row: sqlite3.Row, kind: str) -> dic
     return base
 
 
+def _enrich_record(
+    conn: sqlite3.Connection, rec: dict[str, Any], kind: str
+) -> dict:
+    return _row_to_record(conn, rec, kind)
+
+
 def query_records(
     conn: sqlite3.Connection, ship_no: str, kind: str, version_id: Optional[int]
 ) -> list[dict]:
     version = resolve_version(conn, version_id)
     if version is None:
         return []
-    table = "stop_record" if kind == "stop" else "pending_record"
-    rows = conn.execute(
-        f"SELECT * FROM {table} WHERE version_id=? AND ship_no=? "
-        f"ORDER BY seg_no, run_no",
-        (version["version_id"], ship_no),
-    ).fetchall()
-    return [_row_to_record(conn, r, kind) for r in rows]
+    records = _read_ship_records(conn, version, ship_no, kind)
+    return [_enrich_record(conn, rec, kind) for rec in records]
 
 
 def list_versions(conn: sqlite3.Connection) -> list[dict]:
@@ -547,6 +635,7 @@ def list_versions(conn: sqlite3.Connection) -> list[dict]:
             "created_at": r["created_at"],
             "batches": json.loads(r["batches"]),
             "active": bool(r["active"]),
+            "storage": r["storage"],
         }
         for r in rows
     ]

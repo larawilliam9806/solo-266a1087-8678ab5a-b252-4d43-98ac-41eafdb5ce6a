@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import os
-import tempfile
 
 import pytest
 from fastapi.testclient import TestClient
@@ -397,3 +396,273 @@ def test_write_failure_rolls_back_keeping_original(client, monkeypatch):
     assert client.get("/batches/B2").status_code == 404
     stops = client.get("/ships/S1/stops").json()
     assert len(stops) == 1 and stops[0]["entry_point"]["msg_no"] == "i1"
+
+
+# ---------------------------------------------------------------- 压缩存储
+
+def _db(client):
+    """测试库连接（与 client 共用同一临时文件）。"""
+    from app import database
+
+    return database.connect(os.environ["AIS_DB_PATH"])
+
+
+def test_new_versions_store_only_compressed_blobs(client):
+    submit(
+        client,
+        "B1",
+        [
+            m("o1", "S1", B.format(0), 120.0, 30.0),
+            m("i1", "S1", B.format(5), 121.5, 31.5),
+            m("o2", "S1", B.format(10), 123.0, 33.0),
+            m("p1", "S2", B.format(0), 121.5, 31.5),
+        ],
+    )
+    conn = _db(client)
+    try:
+        # 新版本明细只落压缩块，不再写明文表
+        assert conn.execute("SELECT COUNT(*) FROM stop_record").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM pending_record").fetchone()[0] == 0
+        blobs = conn.execute(
+            "SELECT ship_no, kind, codec, record_count, raw_size, payload "
+            "FROM record_blob ORDER BY ship_no, kind"
+        ).fetchall()
+        assert {(r["ship_no"], r["kind"]) for r in blobs} == {
+            ("S1", "stop"),
+            ("S2", "pending"),
+        }
+        for r in blobs:
+            assert r["codec"] == "json+zlib"
+            assert r["record_count"] == 1
+            assert len(r["payload"]) < r["raw_size"]  # 确实压缩过
+        version = conn.execute("SELECT storage FROM result_version").fetchone()
+        assert version["storage"] == "blob"
+    finally:
+        conn.close()
+
+
+def test_query_decodes_only_requested_ship(client, monkeypatch):
+    for i in range(4):
+        submit(
+            client,
+            f"B{i}",
+            [
+                m(f"o{i}", f"S{i}", B.format(0), 120.0, 30.0),
+                m(f"i{i}", f"S{i}", B.format(5), 121.5, 31.5),
+                m(f"q{i}", f"S{i}", B.format(10), 123.0, 33.0),
+            ],
+        )
+    from app import compress
+
+    calls: list[bytes] = []
+    real_decode = compress.decode_records
+
+    def tracking(payload, codec):
+        calls.append(payload)
+        return real_decode(payload, codec)
+
+    from app import service
+
+    monkeypatch.setattr(service, "decode_records", tracking)
+    stops = client.get("/ships/S2/stops").json()
+    assert [s["entry_point"]["msg_no"] for s in stops] == ["i2"]
+    # 只解码被查询船的那一块
+    assert len(calls) == 1
+
+
+def test_unaffected_ships_carry_compressed_blob_without_decoding(client, monkeypatch):
+    submit(
+        client,
+        "B1",
+        [
+            m("o1", "S1", B.format(0), 120.0, 30.0),
+            m("i1", "S1", B.format(5), 121.5, 31.5),
+            m("o2", "S1", B.format(10), 123.0, 33.0),
+            m("o3", "S2", B.format(0), 120.0, 30.0),
+            m("i2", "S2", B.format(5), 121.5, 31.5),
+            m("o4", "S2", B.format(10), 123.0, 33.0),
+        ],
+    )
+    conn = _db(client)
+    try:
+        old_payload = conn.execute(
+            "SELECT payload FROM record_blob WHERE ship_no='S2' AND kind='stop'"
+        ).fetchone()["payload"]
+    finally:
+        conn.close()
+
+    from app import compress, service
+
+    decoded: list[bytes] = []
+    real_decode = compress.decode_records
+
+    def tracking(payload, codec):
+        decoded.append(payload)
+        return real_decode(payload, codec)
+
+    # 新增只影响 S1；S2 的压缩块直接沿用，不会被解码
+    monkeypatch.setattr(service, "decode_records", tracking)
+    r = submit(client, "B2", [m("z1", "S1", "2026-11-24T10:00:00Z", 121.5, 31.5)])
+    assert r.status_code == 200
+    assert old_payload not in decoded
+
+    conn = _db(client)
+    try:
+        row = conn.execute(
+            "SELECT payload FROM record_blob WHERE version_id=? AND "
+            "ship_no='S2' AND kind='stop'",
+            (r.json()["version_id"],),
+        ).fetchone()
+        assert row["payload"] == old_payload
+    finally:
+        conn.close()
+    stops = client.get("/ships/S2/stops").json()
+    assert [s["entry_point"]["msg_no"] for s in stops] == ["i2"]
+
+
+def test_reuse_of_previous_decision_from_compressed_version(client):
+    submit(
+        client,
+        "B1",
+        [
+            m("o1", "S1", B.format(0), 120.0, 30.0),
+            m("i1", "S1", B.format(5), 121.5, 31.5),
+            m("o2", "S1", B.format(10), 123.0, 33.0),
+        ],
+    )
+    before = client.get("/ships/S1/stops").json()[0]
+    # 新点与第一段相隔 >30 分钟：整段沿用压缩版上的旧判定
+    r = submit(client, "B2", [m("z1", "S1", "2026-11-24T10:00:00Z", 121.5, 31.5)])
+    assert r.json()["reused_records"] == 1
+    after = client.get("/ships/S1/stops").json()[0]
+    assert after["seg_key"] == before["seg_key"]
+    assert after["entry_point"] == before["entry_point"]
+
+
+def test_compress_write_failure_rolls_back_batch_and_version(client, monkeypatch):
+    submit(
+        client,
+        "B1",
+        [
+            m("o1", "S1", B.format(0), 120.0, 30.0),
+            m("i1", "S1", B.format(5), 121.5, 31.5),
+            m("o2", "S1", B.format(10), 123.0, 33.0),
+        ],
+    )
+    versions_before = client.get("/versions").json()
+
+    from app import service
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("compress failed")
+
+    monkeypatch.setattr(service, "encode_records", boom)
+    r = submit(client, "B2", [m("z1", "S1", "2026-11-24T10:00:00Z", 121.5, 31.5)])
+    assert r.status_code == 500
+
+    # 原批次与原版本供数不受影响
+    assert client.get("/versions").json() == versions_before
+    assert client.get("/batches/B2").status_code == 404
+    stops = client.get("/ships/S1/stops").json()
+    assert len(stops) == 1 and stops[0]["entry_point"]["msg_no"] == "i1"
+
+
+def test_legacy_plaintext_version_queryable_and_upgraded_on_first_blob_version(
+    client,
+):
+    """旧库历史版本（明文明细）可直接查；首次生成压缩版时读取上一版明文。"""
+    import json
+
+    from app import database
+
+    db_path = os.environ["AIS_DB_PATH"]
+    conn = database.connect(db_path)
+    try:
+        # 手工构造一个升级前遗留的明文版本（storage=plain）
+        old_version = conn.execute(
+            "INSERT INTO result_version(created_at, batch_set, batches, active, storage) "
+            "VALUES('2026-11-01T00:00:00Z','legacy','[\"OLD1\"]',1,'plain')"
+        ).lastrowid
+        conn.execute(
+            "INSERT INTO batch(batch_no, created_at) VALUES('OLD1','2026-11-01T00:00:00Z')"
+        )
+        point = json.dumps(
+            {
+                "msg_no": "i9",
+                "ts": "2026-11-01T08:05:00Z",
+                "lon": 121.5,
+                "lat": 31.5,
+                "in_port": True,
+            }
+        )
+        before_pt = json.dumps(
+            {
+                "msg_no": "o8",
+                "ts": "2026-11-01T08:00:00Z",
+                "lon": 120.0,
+                "lat": 30.0,
+                "in_port": False,
+            }
+        )
+        after_pt = json.dumps(
+            {
+                "msg_no": "o9",
+                "ts": "2026-11-01T08:10:00Z",
+                "lon": 123.0,
+                "lat": 33.0,
+                "in_port": False,
+            }
+        )
+        seg_key = "o8|2026-11-01T08:00:00Z|o9|2026-11-01T08:10:00Z"
+        conn.execute(
+            "INSERT INTO stop_record(version_id, ship_no, seg_no, run_no, "
+            "entry_point, exit_point, before_point, after_point, seg_key) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            (old_version, "S9", 0, 0, point, point, before_pt, after_pt, seg_key),
+        )
+    finally:
+        conn.close()
+
+    # 旧版本明文记录可直接查
+    legacy_stop = client.get(f"/ships/S9/stops?version_id={old_version}").json()
+    assert len(legacy_stop) == 1
+    assert legacy_stop[0]["entry_point"]["msg_no"] == "i9"
+
+    # 新批次生效生成压缩版，未涉及 S9 -> 从上一版明文首次压缩沿用
+    r = submit(client, "B2", [m("z1", "S1", "2026-11-24T10:00:00Z", 121.5, 31.5)])
+    assert r.status_code == 200
+    new_vid = r.json()["version_id"]
+
+    conn = database.connect(db_path)
+    try:
+        # 新版本 S9 明细以压缩块承载，旧版本明文仍在
+        blob = conn.execute(
+            "SELECT record_count FROM record_blob WHERE version_id=? "
+            "AND ship_no='S9' AND kind='stop'",
+            (new_vid,),
+        ).fetchone()
+        assert blob is not None and blob["record_count"] == 1
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM stop_record WHERE version_id=? AND ship_no='S9'",
+                (new_vid,),
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM stop_record WHERE version_id=? AND ship_no='S9'",
+                (old_version,),
+            ).fetchone()[0]
+            == 1
+        )
+        # 历史明文版本仍在，可继续查
+        storage = conn.execute(
+            "SELECT storage FROM result_version WHERE version_id=?", (old_version,)
+        ).fetchone()["storage"]
+        assert storage == "plain"
+    finally:
+        conn.close()
+
+    carried = client.get(f"/ships/S9/stops?version_id={new_vid}").json()
+    assert carried == legacy_stop
